@@ -1,0 +1,18 @@
+import os
+import time
+import requests
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+def send(msg):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
+
+while True:
+    send(
+        "POLYMASTER TEST ✅\n"
+        "Bot is live in the cloud.\n"
+        "You will now receive alerts here."
+    )
+    time.sleep(3600)
