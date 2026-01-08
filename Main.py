@@ -1,1 +1,0 @@
-print("Polymaster bot starting...")
