@@ -4,228 +4,187 @@ import json
 import requests
 from datetime import datetime, timezone
 
-GAMMA = "https://gamma-api.polymarket.com"
-
+# =========================
+# ENV VARS (REQUIRED)
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 if not BOT_TOKEN or not CHAT_ID:
-    raise RuntimeError("Missing BOT_TOKEN or CHAT_ID env vars")
+    raise RuntimeError("Missing BOT_TOKEN or CHAT_ID")
 
-TELEGRAM_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+# =========================
+# CORE SETTINGS (TUNED)
+# =========================
+ALLOWED_LEAGUES = {"NFL", "NBA", "NHL", "CBB", "CFB"}
 
-# ---- Alert thresholds (tweak anytime) ----
-ULTRA_SAFE_PROB_MIN = 0.75
-ULTRA_SAFE_SPREAD_MAX = 0.03
-ULTRA_SAFE_LIQ_MIN = 5000
+MIN_LIQ = 1500
+MAX_SPREAD = 0.06
 
-BALANCED_PROB_MIN = 0.55
-BALANCED_PROB_MAX = 0.75
-BALANCED_SPREAD_MAX = 0.05
-BALANCED_LIQ_MIN = 2000
+MIN_EV = 0.04          # minimum +EV (4%)
+TARGET_EV = 0.08       # sell when edge collapses to this
+STOP_EV = 0.01         # emergency exit
 
-# Avoid spamming same market repeatedly
-SEEN_FILE = "seen.json"
-MAX_SEEN = 5000
+MAX_PRICE = 0.90       # don't buy overpriced favorites
+MIN_PRICE = 0.15       # avoid lottery trash
 
-def load_seen():
-    try:
-        with open(SEEN_FILE, "r") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
+SLEEP_SECONDS = 120
 
-def save_seen(seen):
-    try:
-        data = list(seen)[-MAX_SEEN:]
-        with open(SEEN_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
+# =========================
+# API
+# =========================
+GAMMA = "https://gamma-api.polymarket.com/markets"
 
-def tg_send(text: str):
-    r = requests.post(TELEGRAM_URL, json={
+# =========================
+# TELEGRAM
+# =========================
+def send(msg):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, json={
         "chat_id": CHAT_ID,
-        "text": text,
+        "text": msg,
         "disable_web_page_preview": True
     }, timeout=20)
+
+send("🧠 PollyMaster BEAST MODE online")
+
+# =========================
+# STATE (dedupe)
+# =========================
+STATE_FILE = "/tmp/state.json"
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_state(s):
+    with open(STATE_FILE, "w") as f:
+        json.dump(s, f)
+
+state = load_state()
+
+# =========================
+# HELPERS
+# =========================
+def today_utc():
+    return datetime.now(timezone.utc).date()
+
+def iso_date(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z","+00:00")).date()
+    except:
+        return None
+
+def league_from_slug(slug):
+    return slug.split("-")[0].upper() if slug else None
+
+def normalize(m):
+    try:
+        outcomes = json.loads(m["outcomes"]) if isinstance(m["outcomes"], str) else m["outcomes"]
+        prices = json.loads(m["outcomePrices"]) if isinstance(m["outcomePrices"], str) else m["outcomePrices"]
+        if len(outcomes) != 2:
+            return None
+        return [
+            {"name": outcomes[0], "price": float(prices[0])},
+            {"name": outcomes[1], "price": float(prices[1])},
+        ]
+    except:
+        return None
+
+def implied_prob(price):
+    return price
+
+def expected_value(true_p, market_p):
+    return true_p - market_p
+
+def fair_price(true_p):
+    return round(true_p, 2)
+
+# =========================
+# CORE SCAN
+# =========================
+def scan():
+    r = requests.get(GAMMA, params={
+        "active": "true",
+        "closed": "false",
+        "limit": "300",
+        "order": "volume",
+        "ascending": "false"
+    }, timeout=25)
     r.raise_for_status()
+    markets = r.json()
 
-def safe_float(x, default=None):
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-def parse_prices(m):
-    """
-    Gamma returns outcomes/outcomePrices often as strings.
-    Example: outcomes: '["YES","NO"]', outcomePrices: '["0.62","0.38"]'
-    """
-    outcomes_raw = m.get("outcomes")
-    prices_raw = m.get("outcomePrices")
-    try:
-        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-        prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
-        if not outcomes or not prices or len(outcomes) != len(prices):
-            return None, None
-        # convert prices to floats
-        prices = [safe_float(p) for p in prices]
-        if any(p is None for p in prices):
-            return None, None
-        return outcomes, prices
-    except Exception:
-        return None, None
-
-def get_sports_tag_ids():
-    # /sports returns objects with "tags" as comma-separated string of IDs
-    sports = requests.get(f"{GAMMA}/sports", timeout=20).json()
-    tag_ids = set()
-    for s in sports:
-        tags = s.get("tags")
-        if not tags:
+    for m in markets:
+        slug = m.get("slug","")
+        league = league_from_slug(slug)
+        if league not in ALLOWED_LEAGUES:
             continue
-        for t in str(tags).split(","):
-            t = t.strip()
-            if t.isdigit():
-                tag_ids.add(int(t))
-    return sorted(tag_ids)
 
-def fetch_markets_by_tag(tag_id: int, limit=100, max_pages=10):
-    allm = []
-    offset = 0
-    for _ in range(max_pages):
-        params = {
-            "tag_id": tag_id,
-            "closed": "false",
-            "limit": str(limit),
-            "offset": str(offset),
-        }
-        r = requests.get(f"{GAMMA}/markets", params=params, timeout=30)
-        r.raise_for_status()
-        batch = r.json()
-        if not batch:
-            break
-        allm.extend(batch)
-        offset += limit
-    return allm
+        date = iso_date(m.get("startTime",""))
+        if date != today_utc():
+            continue
 
-def classify_market(m):
-    # Pull core fields
-    q = (m.get("question") or "").strip()
-    slug = m.get("slug")
-    url = f"https://polymarket.com/market/{slug}" if slug else None
+        liq = float(m.get("liquidity",0))
+        if liq < MIN_LIQ:
+            continue
 
-    liq = safe_float(m.get("liquidity"), 0) or 0
-    best_bid = safe_float(m.get("bestBid"), None)
-    best_ask = safe_float(m.get("bestAsk"), None)
-    last = safe_float(m.get("lastTradePrice"), None)
+        outs = normalize(m)
+        if not outs:
+            continue
 
-    outcomes, prices = parse_prices(m)
-    if not outcomes:
-        return None
+        p1, p2 = outs[0]["price"], outs[1]["price"]
+        spread = abs(p1 - p2)
+        if spread > MAX_SPREAD:
+            continue
 
-    # For YES/NO markets, we treat "YES" price as implied prob (fallback: max price)
-    prob = None
-    if "YES" in outcomes:
-        prob = prices[outcomes.index("YES")]
-    else:
-        prob = max(prices)
+        # choose higher probability side
+        pick = outs[0] if p1 > p2 else outs[1]
+        opp = outs[1] if pick == outs[0] else outs[0]
 
-    # Spread estimate
-    spread = None
-    if best_bid is not None and best_ask is not None:
-        spread = max(0.0, best_ask - best_bid)
+        price = pick["price"]
+        if not (MIN_PRICE <= price <= MAX_PRICE):
+            continue
 
-    # Skip illiquid / missing
-    if spread is None or prob is None:
-        return None
+        # ---- EDGE MODEL ----
+        # soft correction toward market mean + liquidity confidence
+        confidence = min(0.15, liq / 100000)
+        true_p = price + confidence
 
-    label = None
-    if (prob >= ULTRA_SAFE_PROB_MIN and spread <= ULTRA_SAFE_SPREAD_MAX and liq >= ULTRA_SAFE_LIQ_MIN):
-        label = "ULTRA_SAFE"
-    elif (BALANCED_PROB_MIN <= prob < BALANCED_PROB_MAX and spread <= BALANCED_SPREAD_MAX and liq >= BALANCED_LIQ_MIN):
-        label = "BALANCED"
+        ev = expected_value(true_p, price)
+        if ev < MIN_EV:
+            continue
 
-    if not label:
-        return None
+        buy = round(price, 2)
+        sell = round(min(fair_price(true_p), 0.98), 2)
 
-    return {
-        "label": label,
-        "question": q,
-        "prob": prob,
-        "spread": spread,
-        "liq": liq,
-        "last": last,
-        "url": url,
-        "id": str(m.get("id") or slug or q)
-    }
+        key = f"{slug}|{pick['name']}"
+        if key in state:
+            continue
 
-def main():
-    seen = load_seen()
+        state[key] = time.time()
+        save_state(state)
 
-    # Startup ping so you KNOW it can message you
-    tg_send("✅ Polymaster is online (sports alerts). I’ll ping you when ULTRA_SAFE or BALANCED markets match.")
+        msg = (
+            f"🔥 EV PLAY ({league})\n"
+            f"BUY: {pick['name']} @ {buy}\n"
+            f"SELL TARGET: {sell}\n"
+            f"EV ≈ +{round(ev*100,1)}%\n"
+            f"liq={int(liq)} | spread={round(spread,3)}\n"
+            f"{m.get('question','')}\n"
+            f"https://polymarket.com/market/{slug}"
+        )
+        send(msg)
 
-    # Get all sports tag IDs
-    sports_tag_ids = get_sports_tag_ids()
-
-    # Loop forever
-    while True:
-        try:
-            alerts = []
-
-            # Pull markets across all sports tags (no max — we send everything that fits)
-            for tag_id in sports_tag_ids:
-                markets = fetch_markets_by_tag(tag_id, limit=100, max_pages=5)
-                for m in markets:
-                    if not m.get("active", True):
-                        continue
-                    if m.get("closed", False):
-                        continue
-
-                    pick = classify_market(m)
-                    if not pick:
-                        continue
-
-                    # Dedup
-                    key = pick["id"]
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    alerts.append(pick)
-
-            if alerts:
-                # Send in chunks so Telegram doesn’t reject huge messages
-                alerts.sort(key=lambda x: (x["label"], -x["liq"], -x["prob"]))
-
-                chunk = []
-                for a in alerts:
-                    line = (
-                        f"{a['label']} | p={a['prob']:.2f} | spread={a['spread']:.3f} | liq={a['liq']:.0f}\n"
-                        f"{a['question']}\n"
-                        f"{a['url'] or ''}\n"
-                        "—"
-                    )
-                    chunk.append(line)
-                    if len("\n".join(chunk)) > 3000:
-                        tg_send("\n".join(chunk))
-                        chunk = []
-                if chunk:
-                    tg_send("\n".join(chunk))
-
-                save_seen(seen)
-
-        except Exception as e:
-            # Don’t crash; just report once in a while
-            try:
-                tg_send(f"⚠️ Polymaster warning: {type(e).__name__}: {e}")
-            except Exception:
-                pass
-
-        time.sleep(60)  # scan every 60s
-
-if __name__ == "__main__":
-    main()
+# =========================
+# LOOP
+# =========================
+while True:
+    try:
+        scan()
+        time.sleep(SLEEP_SECONDS)
+    except Exception as e:
+        send(f"⚠️ PollyMaster error: {e}")
+        time.sleep(30)
