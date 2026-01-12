@@ -1,4 +1,5 @@
 """
+telegram_send("🧪 TEST: Polymaster booting now")
 POLYMASTER (Safe-Mode Alert Bot)
 - Pulls Polymarket markets from Gamma API
 - Pulls live orderbook summary from CLOB API
